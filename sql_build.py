@@ -25,6 +25,8 @@ Path: root/sql_build.py
 
 import chess.pgn
 import sqlite3
+import json
+import urllib.request
 
 import shutil
 import os
@@ -41,6 +43,7 @@ class Chess_DB:
 
     def __init__(self, path):
         self.path = path
+        self.json_walk = self.json_walk_looping
 
     def open(self):
         self.conn = sqlite3.connect(self.path)
@@ -80,7 +83,7 @@ class Chess_DB:
         self.c.execute("""
             CREATE TABLE IF NOT EXISTS Position (
                 Position_ID INTEGER PRIMARY KEY,
-                Time_Format INTEGER,
+                Time_Format TEXT,
                 Rating_Pool INTEGER,
                 FEN TEXT
             );
@@ -212,7 +215,6 @@ class Chess_DB:
             # Do the move
             board.push(move)
 
-
     def add_state(self, time_format, rating_pool, fen, uci):
         """
             Add a game state to the Position and Move tables
@@ -241,7 +243,7 @@ class Chess_DB:
         # return this index
         return position_ID
     
-    def add_move(self, position_ID, uci):
+    def add_move(self, position_ID, uci, popularity = -1):
         """
             Add a uci move to the Move table.
         """
@@ -254,32 +256,47 @@ class Chess_DB:
             )
             VALUES (?, 0, ?)
         ;""", (position_ID, uci))
-        # Now do an increment
-        self.c.execute("""
-            UPDATE
-                Move
-            SET
-                Popularity = Popularity + 1
-            WHERE
-                Position_ID = ?
-            AND
-                UCI = ?
-        ;""", (position_ID, uci))
-        
+        # Now do an increment if popularity is not specified
+        if popularity == -1:
+            self.c.execute("""
+                UPDATE
+                    Move
+                SET
+                    Popularity = Popularity + 1
+                WHERE
+                    Position_ID = ?
+                AND
+                    UCI = ?
+            ;""", (position_ID, uci))
+        # If popularity is specified, then update the popularity
+        else:
+            self.c.execute("""
+                UPDATE
+                    Move
+                SET
+                    Popularity = ?
+                WHERE
+                    Position_ID = ?
+                AND
+                    UCI = ?
+            ;""", (popularity, position_ID, uci))
+
     def flip_fen(self, fen):
         """
-            Flips a FEN with black to move into a mirrored FEN with white to move.
+            Flips a FEN with black to move into a mirrored FEN with white to move or vise versa
         """
         # Split the FEN
         fen_split = fen.split(' ')
 
         # Make sure it really is black to play
-        fen_split[1] = 'w'
+        white_to_play = fen_split[1] == 'w'
+        fen_split[1] = ['w', 'b'][white_to_play]
 
         # Deal with the en passant part
         en_passant = fen_split[-1]
         if en_passant != '-':
-            en_passant = en_passant.replace('3','6')
+            old_rank, new_rank = ['6', '3'][::white_to_play]
+            en_passant = en_passant.replace(old_rank, new_rank)
             fen_split[-1] = en_passant
         
         # Deal with the castling rights
@@ -290,11 +307,11 @@ class Chess_DB:
             if 'k' in castling:
                 new_castling = 'K'
             if 'q' in castling:
-                new_castling = 'Q'
+                new_castling += 'Q'
             if 'K' in castling:
-                new_castling = 'k'
+                new_castling += 'k'
             if 'Q' in castling:
-                new_castling = 'q'
+                new_castling += 'q'
             fen_split[2] = new_castling
 
         # Deal with board diagram
@@ -312,15 +329,145 @@ class Chess_DB:
 
     def flip_uci(self, uci):
         """
-            Flips a move made by black into the mirrored move made by white.
+            Flips a move made by black into the mirrored move made by white or vise versa
         """
         flipper = {'1':'8', '2':'7', '3':'6', '4':'5', '5':'4', '6':'3', '7':'2', '8':'1'}
         new_uci = uci[0] + flipper[uci[1]] + uci[2] + flipper[uci[3]]
         return new_uci
 
-# db = Chess_DB('lichess_databases/sql/large_test.sqlite')
-# db.open()
-# db.initialize()
-# db.add_pgn('lichess_databases/test/large.pgn')
-# db.commit()
-# db.close()
+    def _json_moves(self, position_ID, json_string):
+        json_moves = json.loads(json_string)['moves']
+        move_popularity = list()
+        for move in json_moves:
+            uci = move['uci']
+            popularity = move['white'] + move['draws'] + move['black']
+            move_popularity.append((uci, popularity))
+        return move_popularity
+
+    def add_json(self, position_ID, move_max = -1,
+        speeds = ['bullet', 'blitz', 'rapid', 'classical'],
+        ratings = [1600, 1800, 2000, 2200, 2500],
+        time_format = None,
+        rating_pool = None):
+        """
+        This method starts from position at position_ID and adds the moves and resultant positions to the database
+        according to the lichess opening explorer database.
+        """
+        # Look up the fen
+        self.c.execute("""
+            SELECT
+                FEN
+            FROM
+                Position
+            WHERE
+                Position_ID = ?
+        ;""", (position_ID, ))
+        white_fen = self.c.fetchone()[0] + ' 0 0' # white to move
+        # Get the flipped fen to check for the same position played as black
+        black_fen = self.flip_fen(white_fen) # black to move
+        # Build the url to the json
+        url = 'https://explorer.lichess.ovh/lichess?variant=standard'
+        for speed in speeds:
+            url += '&speeds[]=%s' % (speed,)
+        for rating in ratings:
+            url += '&ratings[]=%d' % (rating,)
+        if move_max != -1:
+            url += '&moves=%d' % (move_max,)
+        url += '&topGames=0&recentGames=0'
+        white_url = url + '&fen=%s' % (white_fen.replace(' ', '%20'),)
+        black_url = url + '&fen=%s' % (black_fen.replace(' ', '%20'),)
+        # Retrieve the json file and get the moves
+        with urllib.request.urlopen(white_url) as json_file:
+            white_moves = self._json_moves(position_ID, json_file.read())
+        with urllib.request.urlopen(black_url) as json_file:
+            black_moves = self._json_moves(position_ID, json_file.read())
+        # Now consolidate the moves together by making them both black moves.
+        black_moves_combined = dict()
+        for uci, popularity in white_moves:
+            black_moves_combined[self.flip_uci(uci)] = popularity
+        for uci, popularity in black_moves:
+            if uci in black_moves_combined.keys():
+                black_moves_combined[uci] += popularity
+            else:
+                black_moves_combined[uci] = popularity
+        # Add moves to database
+        for uci, popularity in black_moves_combined.items():
+            uci_white = self.flip_uci(uci)
+            self.add_move(position_ID, uci_white, popularity)
+        # Get the list of moves to iterate over
+        ucis = black_moves_combined.keys()
+        # Add each resultant positions to database
+        new_position_IDs = []
+        for uci in ucis:
+            board = chess.Board(black_fen)
+            board.push_uci(uci)
+            new_fen = board.fen()
+            # Ignore halfclock and fullclock counts
+            fen_strip = ' '.join(new_fen.split(' ')[:-2])
+            new_ID = self.add_position(time_format, rating_pool, fen_strip)
+            new_position_IDs.append(new_ID)
+        # Return useful numbers
+        if new_position_IDs == []:
+            1 == 1
+        return new_position_IDs
+    
+    def json_walk_recursive(self, position_ID, move_max = -1, max_depth = -1, depth = 0,
+        speeds = ['bullet', 'blitz', 'rapid', 'classical'],
+        ratings = [1600, 1800, 2000, 2200, 2500],
+        time_format = None,
+        rating_pool = None):
+        """
+        This method starts from position at position_ID and walks through lichess' online
+        json library for every possible move up to move_count to a certain depth.
+        """
+        print('Walking from position %d as depth %d' % (position_ID, depth))
+        # Recursive algorithm
+        if depth != max_depth:
+            new_position_IDs = self.add_json(position_ID, move_max, speeds, ratings, time_format, rating_pool)
+            print('Created new positions', new_position_IDs)
+            for pos_ID in new_position_IDs:
+                self.json_walk(pos_ID, move_max, max_depth, depth + 1, speeds, ratings, time_format, rating_pool)
+    
+    def json_walk_looping(self, position_ID, move_max = 3, max_depth = 3,
+        speeds = ['bullet', 'blitz', 'rapid', 'classical'],
+        ratings = [1600, 1800, 2000, 2200, 2500],
+        time_format = None,
+        rating_pool = None):
+        """
+        This method starts from position at position_ID and walks through lichess' online
+        json library for every possible move up to move_count to a certain depth.
+        """
+        # Figure out how many tasks there will be
+        tasks = move_max**max_depth //(move_max-1)
+        tasks_complete = 0
+        # Make progress bar
+        bar = progressbar.ProgressBar(max_value = tasks)
+        # Keep a heap of all tasks to do.
+        to_check = [(position_ID, 0)]
+        while len(to_check) > 0:
+            # Take the highest depth one
+            check_ID, check_depth = to_check.pop(-1)
+            # Calculate one more level of depth
+            new_position_IDs = self.add_json(position_ID, move_max, speeds, ratings, time_format, rating_pool)
+            # Add to the heap if the depth is not too high
+            if check_depth + 1 != max_depth:
+                for new_ID in new_position_IDs:
+                    to_check.append((new_ID, check_depth+1))
+            # Another task complete
+            tasks_complete += 1
+            bar.update(tasks_complete)
+        bar.finish()
+
+            
+
+
+
+db = Chess_DB('lichess_databases/sql/json_walk.sqlite')
+db.delete()
+db.open()
+db.initialize()
+db.add_position('classical', 1600, 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -')
+# db.add_json(1,3,speeds=['classical'], ratings = [1600], time_format='classica', rating_pool=1600)
+db.json_walk(1,3,10, speeds=['classical'], ratings = [1600], time_format='classical', rating_pool=1600)
+db.commit()
+db.close()
